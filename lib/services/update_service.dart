@@ -26,7 +26,8 @@ class UpdateService {
 
   static const String _apiUrl = 'https://api.github.com/repos/$repoOwner/$repoName/releases/latest';
 
-  /// Kiolvassa az aktuális verziót a pubspec.yaml fájlból
+  static String? downloadedApkPath;
+
   static Future<String> getCurrentVersion() async {
     try {
       final packageInfo = await PackageInfo.fromPlatform();
@@ -36,7 +37,6 @@ class UpdateService {
     }
   }
 
-  /// Ellenőrzi a GitHub API-n, hogy van-e újabb release a jelenlegi verziónál
   static Future<GitHubReleaseInfo?> checkForUpdates() async {
     try {
       final currentVer = await getCurrentVersion();
@@ -62,7 +62,6 @@ class UpdateService {
           downloadUrl = apkAsset['browser_download_url'] ?? htmlUrl;
         }
 
-        // Összehasonlítjuk a verziókat (csak ha a legújabb nagyobb a jelenleginél)
         if (_isNewerVersion(tagName, currentVer)) {
           return GitHubReleaseInfo(
             version: tagName,
@@ -72,13 +71,10 @@ class UpdateService {
           );
         }
       }
-    } catch (_) {
-      // Offline vagy hálózati hiba
-    }
+    } catch (_) {}
     return null;
   }
 
-  /// Verzió összehasonlító (pl. 1.0.1 > 1.0.0)
   static bool _isNewerVersion(String latest, String current) {
     try {
       final latestParts = latest.split('.').map((e) => int.tryParse(e) ?? 0).toList();
@@ -94,14 +90,14 @@ class UpdateService {
     }
   }
 
-  /// Valódi APK letöltés háttérben streamelve és telepítő indítása
+  /// APK letöltése nyilvános tárhelyre + intelligens telepítési fallback
   static Future<bool> downloadAndInstallApk({
     required String downloadUrl,
     required Function(double progress) onProgress,
   }) async {
     try {
-      // Ha nem közvetlen APK fájlra mutat (pl. weblap), megnyitjuk külső böngészőben
-      if (!downloadUrl.endsWith('.apk')) {
+      // 1. Ha nem közvetlen APK URL, megnyitjuk a külső böngészőben
+      if (!downloadUrl.endsWith('.apk') && !downloadUrl.contains('.apk')) {
         final uri = Uri.parse(downloadUrl);
         if (await canLaunchUrl(uri)) {
           await launchUrl(uri, mode: LaunchMode.externalApplication);
@@ -111,41 +107,95 @@ class UpdateService {
 
       final client = http.Client();
       final request = http.Request('GET', Uri.parse(downloadUrl));
+      request.followRedirects = true;
+      request.maxRedirects = 10;
+
       final response = await client.send(request);
 
-      if (response.statusCode != 200) return false;
+      if (response.statusCode != 200) {
+        final uri = Uri.parse(downloadUrl);
+        if (await canLaunchUrl(uri)) {
+          await launchUrl(uri, mode: LaunchMode.externalApplication);
+        }
+        return false;
+      }
 
       final contentLength = response.contentLength ?? 0;
-      final tempDir = await getTemporaryDirectory();
-      final filePath = '${tempDir.path}/moneybox_update.apk';
+
+      // Nyilvános letöltési mappába mentünk, hogy az Android Csomagtelepítő könnyen hozzáférjen
+      Directory? storageDir;
+      if (Platform.isAndroid) {
+        storageDir = Directory('/storage/emulated/0/Download');
+        if (!await storageDir.exists()) {
+          storageDir = await getExternalStorageDirectory();
+        }
+      }
+      storageDir ??= await getTemporaryDirectory();
+
+      final filePath = '${storageDir.path}/MoneyBox_v_update.apk';
+      downloadedApkPath = filePath;
       final file = File(filePath);
+
+      if (await file.exists()) {
+        await file.delete();
+      }
 
       int bytesDownloaded = 0;
       final sink = file.openWrite();
+      DateTime lastUiUpdate = DateTime.now();
 
-      await response.stream.forEach((chunk) {
+      await response.stream.listen((chunk) {
         bytesDownloaded += chunk.length;
         sink.add(chunk);
-        if (contentLength > 0) {
+
+        final now = DateTime.now();
+        if (contentLength > 0 && now.difference(lastUiUpdate).inMilliseconds > 80) {
+          lastUiUpdate = now;
           onProgress(bytesDownloaded / contentLength);
         }
-      });
+      }).asFuture();
 
+      onProgress(1.0);
       await sink.flush();
       await sink.close();
 
-      // Automatikus telepítés elindítása
-      final result = await OpenFilex.open(
-        filePath,
-        type: 'application/vnd.android.package-archive',
-      );
-
-      return result.type == ResultType.done;
+      return await installDownloadedApk(fallbackUrl: downloadUrl);
     } catch (e) {
-      // Fallback: Ha elakad a letöltés vagy a fájl megnyitás, megnyitjuk a GitHub-ot
       final uri = Uri.parse(downloadUrl);
       if (await canLaunchUrl(uri)) {
         await launchUrl(uri, mode: LaunchMode.externalApplication);
+      }
+      return false;
+    }
+  }
+
+  static Future<bool> installDownloadedApk({String? fallbackUrl}) async {
+    if (downloadedApkPath == null) return false;
+    try {
+      final file = File(downloadedApkPath!);
+      if (!await file.exists()) return false;
+
+      final result = await OpenFilex.open(
+        downloadedApkPath!,
+        type: 'application/vnd.android.package-archive',
+      );
+
+      // Ha az Android csomagtelepítő nem tudta megenyitni (pl. eltérő aláírási kulcs miatt),
+      // felajánljuk a közvetlen letöltési linket
+      if (result.type != ResultType.done && fallbackUrl != null) {
+        final uri = Uri.parse(fallbackUrl);
+        if (await canLaunchUrl(uri)) {
+          await launchUrl(uri, mode: LaunchMode.externalApplication);
+        }
+      }
+
+      return result.type == ResultType.done;
+    } catch (_) {
+      if (fallbackUrl != null) {
+        final uri = Uri.parse(fallbackUrl);
+        if (await canLaunchUrl(uri)) {
+          await launchUrl(uri, mode: LaunchMode.externalApplication);
+        }
       }
       return false;
     }

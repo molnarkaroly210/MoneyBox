@@ -251,7 +251,15 @@ class _UpdateDialogState extends State<UpdateDialog> {
                     padding: const EdgeInsets.symmetric(vertical: 14),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                   ),
-                  onPressed: _isDownloading ? null : _startRealDownload,
+                  onPressed: _isDownloading
+                      ? null
+                      : () {
+                          if (_downloadFinished) {
+                            UpdateService.installDownloadedApk();
+                          } else {
+                            _startRealDownload();
+                          }
+                        },
                   icon: Icon(_downloadFinished ? Icons.install_mobile_rounded : Icons.download_rounded, size: 20),
                   label: Text(
                     _downloadFinished ? 'Telepítés' : 'Frissítés',

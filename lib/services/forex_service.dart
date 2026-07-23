@@ -28,7 +28,7 @@ class LiveRates {
     'fetchedAt': fetchedAt.toIso8601String(),
   };
 
-  factory LiveRates.fromJson(Map<String, dynamic> json, {bool isOffline = true}) {
+  factory LiveRates.fromJson(Map<String, dynamic> json, {bool isOffline = false}) {
     return LiveRates(
       base: json['base'] as String,
       rates: (json['rates'] as Map<String, dynamic>).map((k, v) => MapEntry(k, (v as num).toDouble())),
@@ -38,23 +38,20 @@ class LiveRates {
     );
   }
 
-  /// Convert: how many [to] for 1 [from]
   double getRate(String from, String to) {
     if (from == to) return 1.0;
-
     final rateFrom = rates[from];
     final rateTo   = rates[to];
-
     if (rateFrom == null || rateTo == null) {
       return mockRate(from, to);
     }
-
     return rateTo / rateFrom;
   }
 }
 
-/// ForexService — fetches real-time rates with reliable primary & fallback APIs
+/// ForexService — multi-fallback ultra-reliable exchange rate fetcher
 class ForexService extends ChangeNotifier {
+  static const _frankfurterUrl = 'https://api.frankfurter.app/latest?from=USD';
   static const _openErApiUrl = 'https://open.er-api.com/v6/latest/USD';
   static const _awesomeApiUrl = 'https://economia.awesomeapi.com.br/json/last';
 
@@ -78,7 +75,7 @@ class ForexService extends ChangeNotifier {
       notifyListeners();
     }
     await _fetch();
-    _timer = Timer.periodic(const Duration(minutes: 5), (_) => _fetch());
+    _timer = Timer.periodic(const Duration(minutes: 3), (_) => _fetch());
   }
 
   Future<void> refresh() => _fetch();
@@ -96,11 +93,16 @@ class ForexService extends ChangeNotifier {
 
   Future<void> _fetch() async {
     _loading = true;
+    _error = null;
     notifyListeners();
 
     try {
-      // 1. Próbálkozunk az elsődleges Open ER-API szolgáltatóval (nagyon gyors & megbízható)
-      final result = await _fetchFromOpenErApi() ?? await _fetchFromAwesomeApi();
+      // 1. Try Frankfurter API (ECB official API - fastest in EU)
+      // 2. Try Open ER-API
+      // 3. Try AwesomeAPI
+      final result = await _fetchFromFrankfurter() ?? 
+                     await _fetchFromOpenErApi() ?? 
+                     await _fetchFromAwesomeApi();
 
       if (result != null) {
         _rates = result;
@@ -111,20 +113,60 @@ class ForexService extends ChangeNotifier {
         } catch (_) {}
       } else {
         await _loadFromCache();
+        if (_rates == null) {
+          _error = 'Hálózati hiba: Nem sikerült csatlakozni az árfolyam kiszolgálóhoz.';
+        }
       }
     } catch (e) {
       await _loadFromCache();
-      _error = e.toString();
+      _error = 'Kapcsolódási hiba: $e';
     }
 
     _loading = false;
     notifyListeners();
   }
 
-  /// Elsődleges gyors & megbízható API (open.er-api.com)
+  /// 1. Primary EU API: Frankfurter (ECB rates)
+  Future<LiveRates?> _fetchFromFrankfurter() async {
+    try {
+      final resp = await http.get(Uri.parse(_frankfurterUrl)).timeout(const Duration(seconds: 6));
+      if (resp.statusCode == 200) {
+        final data = json.decode(resp.body) as Map<String, dynamic>;
+        if (data['rates'] != null) {
+          final rawRates = data['rates'] as Map<String, dynamic>;
+          final r = <String, double>{};
+          final c = <String, double>{};
+
+          r['USD'] = 1.0;
+          c['USD'] = 0.0;
+
+          for (final entry in rawRates.entries) {
+            r[entry.key] = (entry.value as num).toDouble();
+            c[entry.key] = mockChange(entry.key);
+          }
+
+          // Fill mock/fallback values for cryptos or missing items
+          for (final code in mockAllCodes) {
+            if (!r.containsKey(code)) {
+              r[code] = mockRate('USD', code);
+              c[code] = mockChange(code);
+            }
+          }
+
+          debugPrint('[ForexService] Frankfurter API fetch SUCCESS! USD-HUF=${r['HUF']}');
+          return LiveRates(base: 'USD', rates: r, changes: c, fetchedAt: DateTime.now(), isOffline: false);
+        }
+      }
+    } catch (e) {
+      debugPrint('[ForexService] Frankfurter API failed: $e');
+    }
+    return null;
+  }
+
+  /// 2. Secondary API: Open ER-API
   Future<LiveRates?> _fetchFromOpenErApi() async {
     try {
-      final resp = await http.get(Uri.parse(_openErApiUrl)).timeout(const Duration(seconds: 8));
+      final resp = await http.get(Uri.parse(_openErApiUrl)).timeout(const Duration(seconds: 6));
       if (resp.statusCode == 200) {
         final data = json.decode(resp.body) as Map<String, dynamic>;
         if (data['result'] == 'success' && data['rates'] != null) {
@@ -134,24 +176,27 @@ class ForexService extends ChangeNotifier {
 
           for (final entry in rawRates.entries) {
             r[entry.key] = (entry.value as num).toDouble();
-            c[entry.key] = mockChange(entry.key); // 24h change estimate
+            c[entry.key] = mockChange(entry.key);
           }
 
-          // Cryptos fallback values
-          r['BTC'] = rawRates['BTC'] != null ? (rawRates['BTC'] as num).toDouble() : mockRate('USD', 'BTC');
-          r['ETH'] = rawRates['ETH'] != null ? (rawRates['ETH'] as num).toDouble() : mockRate('USD', 'ETH');
+          for (final code in mockAllCodes) {
+            if (!r.containsKey(code)) {
+              r[code] = mockRate('USD', code);
+              c[code] = mockChange(code);
+            }
+          }
 
           debugPrint('[ForexService] Open ER-API fetch SUCCESS! USD-HUF=${r['HUF']}');
           return LiveRates(base: 'USD', rates: r, changes: c, fetchedAt: DateTime.now(), isOffline: false);
         }
       }
     } catch (e) {
-      debugPrint('[ForexService] Open ER-API failed, switching fallback: $e');
+      debugPrint('[ForexService] Open ER-API failed: $e');
     }
     return null;
   }
 
-  /// Másodlagos tartalék API (AwesomeAPI)
+  /// 3. Tertiary API: AwesomeAPI
   Future<LiveRates?> _fetchFromAwesomeApi() async {
     try {
       final targetCodes = mockAllCodes.where((c) => c != 'USD').toList();
@@ -160,7 +205,7 @@ class ForexService extends ChangeNotifier {
 
       final fiatPairs = fiatCodes.map((c) => 'USD-$c').join(',');
       final url = '$_awesomeApiUrl/$fiatPairs';
-      final resp = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 8));
+      final resp = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 6));
 
       if (resp.statusCode == 200) {
         final data = json.decode(resp.body) as Map<String, dynamic>;

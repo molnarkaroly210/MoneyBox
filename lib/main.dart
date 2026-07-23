@@ -7,6 +7,8 @@ import 'screens/news_screen.dart';
 import 'screens/settings_screen.dart';
 import 'services/forex_service.dart';
 import 'services/settings_service.dart';
+import 'services/update_service.dart';
+import 'widgets/update_dialog.dart';
 
 // ── Static design tokens (never change) ───────────────────────────────────
 const kBg       = Color(0xFF060B14);
@@ -80,6 +82,21 @@ class MainShell extends StatefulWidget {
 
 class _MainShellState extends State<MainShell> with SingleTickerProviderStateMixin {
   int _idx = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    // Automatikus frissítés ellenőrzés az alkalmazás indulásakor
+    _checkAppUpdate();
+  }
+
+  Future<void> _checkAppUpdate() async {
+    await Future.delayed(const Duration(milliseconds: 1500));
+    final info = await UpdateService.checkForUpdates();
+    if (mounted && info != null) {
+      UpdateDialog.show(context, info);
+    }
+  }
 
   static const _items = [
     _NavItem(Icons.swap_vertical_circle_rounded, Icons.swap_vertical_circle_outlined, 'Átváltó'),

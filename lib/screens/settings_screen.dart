@@ -6,6 +6,8 @@ import '../services/forex_service.dart';
 import '../data/mock_data.dart';
 import 'licenses_screen.dart';
 import 'packing_list_screen.dart';
+import '../services/update_service.dart';
+import '../widgets/update_dialog.dart';
 
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
@@ -79,7 +81,13 @@ class _Header extends StatelessWidget {
               borderRadius: BorderRadius.circular(20),
               border: Border.all(color: kBorder),
             ),
-            child: const Text('v1.0.0', style: TextStyle(color: kDim2, fontSize: 11, fontWeight: FontWeight.w600)),
+            child: FutureBuilder<String>(
+              future: UpdateService.getCurrentVersion(),
+              builder: (context, snapshot) {
+                final ver = snapshot.data ?? '1.0.0';
+                return Text('v$ver', style: const TextStyle(color: kDim2, fontSize: 11, fontWeight: FontWeight.w600));
+              },
+            ),
           ),
         ],
       ),
@@ -734,13 +742,65 @@ class _AboutSection extends StatelessWidget {
       icon: Icons.info_outline_rounded,
       iconColor: kDim2,
       children: [
-        _infoRow('Verzió', 'MoneyBox 1.0.0'),
+        FutureBuilder<String>(
+          future: UpdateService.getCurrentVersion(),
+          builder: (context, snapshot) => _infoRow('Verzió', 'MoneyBox ${snapshot.data ?? '1.0.0'}'),
+        ),
         Container(height: 1, margin: const EdgeInsets.only(left: 16), color: kBorder),
         _infoRow('Adatforrás', 'open.er-api.com · frankfurter.dev'),
         Container(height: 1, margin: const EdgeInsets.only(left: 16), color: kBorder),
         _infoRow('Frissítési mód', 'Automatikus · ${s.refreshMinutes} percenként'),
         Container(height: 1, margin: const EdgeInsets.only(left: 16), color: kBorder),
-        _infoRow('Devizák száma', '${mockAllCodes.length} deviza'),
+        GestureDetector(
+          onTap: () async {
+            HapticFeedback.lightImpact();
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Frissítések keresése a GitHubon...'),
+                duration: Duration(seconds: 2),
+              ),
+            );
+            final currentVer = await UpdateService.getCurrentVersion();
+            final info = await UpdateService.checkForUpdates();
+            if (context.mounted) {
+              if (info != null) {
+                UpdateDialog.show(context, info);
+              } else {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    backgroundColor: kSurface2,
+                    content: Row(
+                      children: [
+                        Icon(Icons.check_circle_rounded, color: s.accentColor, size: 20),
+                        const SizedBox(width: 10),
+                        Text('A legfrissebb verziót használod! (v$currentVer)', style: const TextStyle(color: Colors.white)),
+                      ],
+                    ),
+                  ),
+                );
+              }
+            }
+          },
+          child: Container(
+            color: Colors.transparent,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
+            child: Row(
+              children: [
+                const Text('Frissítések keresése', style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500)),
+                const Spacer(),
+                FutureBuilder<String>(
+                  future: UpdateService.getCurrentVersion(),
+                  builder: (context, snapshot) {
+                    final ver = snapshot.data ?? '1.0.0';
+                    return Text('v$ver', style: TextStyle(color: s.accentColor, fontSize: 12, fontWeight: FontWeight.w700));
+                  },
+                ),
+                const SizedBox(width: 6),
+                const Icon(Icons.refresh_rounded, color: kDim2, size: 18),
+              ],
+            ),
+          ),
+        ),
         Container(height: 1, margin: const EdgeInsets.only(left: 16), color: kBorder),
         GestureDetector(
           onTap: () {

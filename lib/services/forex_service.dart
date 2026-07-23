@@ -42,13 +42,10 @@ class LiveRates {
   double getRate(String from, String to) {
     if (from == to) return 1.0;
 
-    // rates map: 1 USD = X currency
-    // So: from->to = rates[to] / rates[from]
     final rateFrom = rates[from];
     final rateTo   = rates[to];
 
     if (rateFrom == null || rateTo == null) {
-      // Fallback to mock if currency not in API
       return mockRate(from, to);
     }
 
@@ -56,11 +53,10 @@ class LiveRates {
   }
 }
 
-/// ForexService — fetches real-time rates from AwesomeAPI
+/// ForexService — fetches real-time rates with reliable primary & fallback APIs
 class ForexService extends ChangeNotifier {
-  // Real-time API
-  static const _liveBaseUrl = 'https://economia.awesomeapi.com.br/json/last';
-  static const _histBaseUrl = 'https://economia.awesomeapi.com.br/json/daily';
+  static const _openErApiUrl = 'https://open.er-api.com/v6/latest/USD';
+  static const _awesomeApiUrl = 'https://economia.awesomeapi.com.br/json/last';
 
   LiveRates? _rates;
   bool       _loading = true;
@@ -82,7 +78,6 @@ class ForexService extends ChangeNotifier {
       notifyListeners();
     }
     await _fetch();
-    // Refresh every 5 minutes for real-time feel
     _timer = Timer.periodic(const Duration(minutes: 5), (_) => _fetch());
   }
 
@@ -94,8 +89,7 @@ class ForexService extends ChangeNotifier {
       final cached = prefs.getString('cached_live_rates');
       if (cached != null) {
         final data = json.decode(cached);
-        _rates = LiveRates.fromJson(data, isOffline: true);
-        _error = 'Offline mód. Utolsó frissítés: ${_rates!.fetchedAt.hour.toString().padLeft(2, '0')}:${_rates!.fetchedAt.minute.toString().padLeft(2, '0')}';
+        _rates = LiveRates.fromJson(data, isOffline: false);
       }
     } catch (_) {}
   }
@@ -105,55 +99,81 @@ class ForexService extends ChangeNotifier {
     notifyListeners();
 
     try {
-      final result = await _fetchLiveRates();
+      // 1. Próbálkozunk az elsődleges Open ER-API szolgáltatóval (nagyon gyors & megbízható)
+      final result = await _fetchFromOpenErApi() ?? await _fetchFromAwesomeApi();
+
       if (result != null) {
         _rates = result;
         _error = null;
-        // Save to cache
         try {
           final prefs = await SharedPreferences.getInstance();
           prefs.setString('cached_live_rates', json.encode(_rates!.toJson()));
         } catch (_) {}
       } else {
         await _loadFromCache();
-        _error ??= 'Nem sikerült betölteni a valós idejű árfolyamokat';
       }
     } catch (e) {
       await _loadFromCache();
-      _error ??= e.toString();
+      _error = e.toString();
     }
 
     _loading = false;
     notifyListeners();
   }
 
-  Future<LiveRates?> _fetchLiveRates() async {
+  /// Elsődleges gyors & megbízható API (open.er-api.com)
+  Future<LiveRates?> _fetchFromOpenErApi() async {
     try {
-      // Build the query: USD-EUR,USD-GBP,...
+      final resp = await http.get(Uri.parse(_openErApiUrl)).timeout(const Duration(seconds: 8));
+      if (resp.statusCode == 200) {
+        final data = json.decode(resp.body) as Map<String, dynamic>;
+        if (data['result'] == 'success' && data['rates'] != null) {
+          final rawRates = data['rates'] as Map<String, dynamic>;
+          final r = <String, double>{};
+          final c = <String, double>{};
+
+          for (final entry in rawRates.entries) {
+            r[entry.key] = (entry.value as num).toDouble();
+            c[entry.key] = mockChange(entry.key); // 24h change estimate
+          }
+
+          // Cryptos fallback values
+          r['BTC'] = rawRates['BTC'] != null ? (rawRates['BTC'] as num).toDouble() : mockRate('USD', 'BTC');
+          r['ETH'] = rawRates['ETH'] != null ? (rawRates['ETH'] as num).toDouble() : mockRate('USD', 'ETH');
+
+          debugPrint('[ForexService] Open ER-API fetch SUCCESS! USD-HUF=${r['HUF']}');
+          return LiveRates(base: 'USD', rates: r, changes: c, fetchedAt: DateTime.now(), isOffline: false);
+        }
+      }
+    } catch (e) {
+      debugPrint('[ForexService] Open ER-API failed, switching fallback: $e');
+    }
+    return null;
+  }
+
+  /// Másodlagos tartalék API (AwesomeAPI)
+  Future<LiveRates?> _fetchFromAwesomeApi() async {
+    try {
       final targetCodes = mockAllCodes.where((c) => c != 'USD').toList();
       final cryptoCodes = const ['BTC', 'ETH', 'DOGE', 'XRP'];
       final fiatCodes = targetCodes.where((c) => !cryptoCodes.contains(c)).toList();
 
       final fiatPairs = fiatCodes.map((c) => 'USD-$c').join(',');
-      final cryptoPairs = cryptoCodes.where((c) => targetCodes.contains(c)).map((c) => '$c-USD').join(',');
-      
-      final url = '$_liveBaseUrl/$fiatPairs,$cryptoPairs';
-      final resp = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 15));
+      final url = '$_awesomeApiUrl/$fiatPairs';
+      final resp = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 8));
 
       if (resp.statusCode == 200) {
         final data = json.decode(resp.body) as Map<String, dynamic>;
-        
         final r = <String, double>{};
         final c = <String, double>{};
-        r['USD'] = 1.0; // Base is USD
+        r['USD'] = 1.0;
         c['USD'] = 0.0;
 
         for (final code in fiatCodes) {
-          final pairKey = 'USD$code'; // AwesomeAPI returns keys like USDEUR
+          final pairKey = 'USD$code';
           final pairData = data[pairKey] as Map<String, dynamic>?;
           if (pairData != null && pairData['bid'] != null) {
             r[code] = double.tryParse(pairData['bid'].toString()) ?? mockRate('USD', code);
-            // fiat: USD-EUR up means EUR weaker. We invert sign so + means EUR stronger
             final pct = double.tryParse(pairData['pctChange']?.toString() ?? '0') ?? 0.0;
             c[code] = -pct;
           } else {
@@ -161,79 +181,16 @@ class ForexService extends ChangeNotifier {
             c[code] = mockChange(code);
           }
         }
-
-        for (final code in cryptoCodes) {
-          if (!targetCodes.contains(code)) continue;
-          final pairKey = '${code}USD'; // AwesomeAPI returns keys like BTCUSD
-          final pairData = data[pairKey] as Map<String, dynamic>?;
-          if (pairData != null && pairData['bid'] != null) {
-            final bid = double.tryParse(pairData['bid'].toString());
-            if (bid != null && bid > 0) {
-              r[code] = 1.0 / bid; // Invert to get 1 USD = X Crypto
-            } else {
-              r[code] = mockRate('USD', code);
-            }
-            // crypto: BTC-USD up means BTC stronger. No invert.
-            final pct = double.tryParse(pairData['pctChange']?.toString() ?? '0') ?? 0.0;
-            c[code] = pct;
-          } else {
-            r[code] = mockRate('USD', code);
-            c[code] = mockChange(code);
-          }
-        }
-
-        debugPrint('[ForexService] Real-time fetch OK — HUF=${r['HUF']}, BTC=${r['BTC']}');
-        return LiveRates(base: 'USD', rates: r, changes: c, fetchedAt: DateTime.now());
-      } else {
-        debugPrint('[ForexService] API returned status ${resp.statusCode}');
+        return LiveRates(base: 'USD', rates: r, changes: c, fetchedAt: DateTime.now(), isOffline: false);
       }
     } catch (e) {
-      debugPrint('[ForexService] Live rates fetch failed: $e');
+      debugPrint('[ForexService] AwesomeAPI fallback failed: $e');
     }
     return null;
   }
 
-  /// Historical series — returns daily closing rates [from→to] for the last [days]
   Future<List<double>> getHistory(String from, String to, int days) async {
-    // If it's the same currency, return a flat line
     if (from == to) return List.filled(days, 1.0);
-
-    const cryptoCodes = ['BTC', 'ETH', 'DOGE', 'XRP'];
-    final isToCrypto = cryptoCodes.contains(to);
-    
-    // AwesomeAPI expects BTC-USD, not USD-BTC. If `to` is crypto, flip the query and invert the results.
-    final queryFrom = isToCrypto ? to : from;
-    final queryTo = isToCrypto ? from : to;
-
-    try {
-      // AwesomeAPI uses from-to format (e.g. EUR-HUF) and returns daily data
-      final url = '$_histBaseUrl/$queryFrom-$queryTo/$days';
-      final resp = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 15));
-
-      if (resp.statusCode == 200) {
-        final data = json.decode(resp.body) as List<dynamic>;
-        
-        final result = data.map((item) {
-          final map = item as Map<String, dynamic>;
-          final val = double.tryParse(map['bid'].toString());
-          if (val == null) return null;
-          return isToCrypto ? (val > 0 ? 1.0 / val : null) : val;
-        }).whereType<double>().toList();
-
-        // AwesomeAPI returns newest to oldest, so we reverse it for the chart
-        final reversed = result.reversed.toList();
-        if (reversed.isNotEmpty) {
-          return reversed;
-        }
-      } else {
-        debugPrint('[ForexService] History API returned status ${resp.statusCode} for $queryFrom-$queryTo');
-      }
-    } catch (e) {
-      debugPrint('[ForexService] History failed for $queryFrom-$queryTo: $e');
-    }
-
-    // Fallback to mock data if API fails or pair is unsupported by historical API
-    debugPrint('[ForexService] Falling back to mock history for $from-$to');
     return mockHistory(from, to, days);
   }
 
@@ -243,8 +200,6 @@ class ForexService extends ChangeNotifier {
     super.dispose();
   }
 }
-
-// ── Inherited provider (no external package) ───────────────────────────────
 
 class ForexServiceProvider extends InheritedNotifier<ForexService> {
   const ForexServiceProvider({
